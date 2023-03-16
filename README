@@ -27,13 +27,17 @@ optional arguments:
   -d n, --min-depth n   Read depth below which a base is not called (default:
                         1)
   --max-depth n         Maximum number of reads considered for a single
-                        consensus position (default: 8000)
+                        consensus position (default: 10000000)
   -a, --ambiguous       Call bases below threshold with ambiguity codes
                         (default: False)
   --ignore-read-groups  Ignore read groups and lump all reads into one
                         consensus (default: False)
   --missing-quality q   Quality score to use for bases missing a quality score
                         (default: 0)
+  --max_rg              Number of read groups to be considered at a time.
+                        Directly correlates with RAM consumption. (default: 100)
+  --max_gap             Maximum accepted size of gap. If gap is larger, read
+                        will be discarded. (default: 35)
 
 version 1.2.2
 Copyright 2015–2018 by Thomas Sibley <trsibley@uw.edu>

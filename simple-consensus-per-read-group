@@ -365,7 +365,7 @@ def parseCommandArguments(*args):
     parser.add_argument("--max-depth",
         dest     = "maxDepth",
         type     = int,
-        default  = 100000, ###adjust this later
+        default  = 10000000, ###adjust this later
         help     = "Maximum number of reads considered for a single consensus position",
         metavar  = "n")
 
