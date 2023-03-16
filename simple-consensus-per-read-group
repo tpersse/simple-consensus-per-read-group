@@ -1,115 +1,319 @@
 #!/usr/bin/env python
 # vim: set fileencoding=UTF-8 :
-import sys, re, argparse
 
+## TO DO
+## - add unit tests []
+## - improve variable names []
+## - add maximum insert length []
+## - change function names, break up further?
+
+import sys, argparse, math
+import numpy as np
 from textwrap import dedent
-from pysam    import AlignmentFile, qualities_to_qualitystring
+import pysam
 
-__version__ = '1.2.2'
+__version__ = 'persse_v2'
+
+def qual_fix(quals):
+	'''This function takes in a list of quality scores, converts them to a numpy array, then scales their value into a composite refleciton of our total confidence in a given base call, with a maximum value of 81'''
+	scale = np.flip((np.arange(len(quals)) + 1) / len(quals))
+	quals = np.flip(np.sort(np.array(quals)))
+	weighted = 10**(quals/10)
+	added = sum(np.multiply(scale, weighted))
+	qual = math.log10(added) * 10
+	if qual > 81:
+		qual = 81
+	return(qual)
+
+def strsplit(word):
+	'''Very simple function to split up a string, makes the code read easer to function-ize it'''
+	return [char for char in word]
+	
+def find_index(most_common_bp, bases, quals):
+	'''Function to isolate quality scores that correspond to bases which match our most common base call. Might be improved to add a punitive measure if base call does not agree with the most common base call.'''
+	array = np.array(bases)
+	ind = np.where(array == most_common_bp)
+	new_quals = []
+	for i in ind:
+		new_quals.append(quals[i])
 
 class SimpleConsensus:
-    def __init__(self, **args):
-        self.input              = AlignmentFile( args['inputFile'] )
-        self.threshold          = args['threshold']
-        self.minDepth           = args['minDepth']
-        self.maxDepth           = args['maxDepth']
-        self.ignoreReadGroups   = args['ignoreReadGroups']
-        self.missingQuality     = args['missingQuality']
-        self.callAmbiguousBases = args['ambiguous']
-        self.ambiguity = {
-                "A":    "A",
-                "C":    "C",
-                "G":    "G",
-                "T":    "T",
-                "AC":   "M",
-                "AG":   "R",
-                "AT":   "W",
-                "CG":   "S",
-                "CT":   "Y",
-                "GT":   "K",
-                "ACG":  "V",
-                "ACT":  "H",
-                "AGT":  "D",
-                "CGT":  "B",
-                "ACGT": "N"
-                }
+	def __init__(self, **args):
+		self.filename		    = args['inputFile']
+		self.input			    = pysam.AlignmentFile( args['inputFile'] , 'rb')
+		self.threshold		    = args['threshold']
+		self.minDepth		    = args['minDepth']
+		self.maxDepth		    = args['maxDepth']
+		self.ignoreReadGroups   = args['ignoreReadGroups']
+		self.missingQuality		= args['missingQuality']
+		self.callAmbiguousBases = args['ambiguous']
+		self.maxrg				= int(args['max_rg'])
+		self.max_gap			= int(args['max_gap'])
+		self.ambiguity = {
+				"A":	"A",
+				"C":	"C",
+				"G":	"G",
+				"T":	"T",
+				"AC":   "M",
+				"AG":   "R",
+				"AT":   "W",
+				"CG":   "S",
+				"CT":   "Y",
+				"GT":   "K",
+				"ACG":  "V",
+				"ACT":  "H",
+				"AGT":  "D",
+				"CGT":  "B",
+				"ACGT": "N"
+				}
 
-    def run(self):
-        pileup = self.input.pileup( stepper = 'all', max_depth = self.maxDepth )
-        groups = {}
+	def build_dict(self, site, groups):
+		# print(site)
+		rpos = site.reference_pos # get reference position of site
+		for read in site.pileups: # loop through all reads mapping to site in pileup
+			deletion = False # initialize a boolean variable that will inform whether read is a deletion
+			if read.is_del:
+				deletion = True
+			alignment = read.alignment # get more than just read, all? info.... could be same thing as pileupread
+			rg = "@" # creating a read group variable, starts with @ to serve as identifier
+			leftmost = alignment.reference_start
+			if not self.ignoreReadGroups:
+				try:
+					rg += alignment.get_tag('RG') # pull rg flag out of alignment, add to rg variable
+				except KeyError: # No read group for this read?!
+					print('read has no read group')
+					continue
+			else: # does not happen unless rg is turned off when running
+				rg += 'Consensus'
+			if rg not in groups: # add new readgroup to the groups dictionary if the readgroup has not been seen before
+				groups[rg] = {}
+				groups[rg]['leftmost'] = leftmost # stores the leftmost mapping position for a given read group
+				pos = (rpos - leftmost) # using the reference position of a given base and the leftmost position of that read group to define the relative position of a base call within a consensus read
+			else:
+				l = groups[rg]['leftmost']
+				pos = (rpos - l) # same as above, creating a relative position for each base call within a fragment based on leftmost position and reference position
+		### CHECKING FOR INSERTIONS/DELETIONS
 
-        for site in pileup:
-            rpos = site.reference_pos
+			qpos = read.query_position
+			if pos not in groups[rg]: # check to see 
+				groups[rg][pos] = { 'bases': [], 'quals': [], 'insertion':{'bases':[], 'quals': []}}
+			if deletion == True: # if true, indicates deletion present at position
+				# Here, we catch deletions and add 'del' to a position. This allows for removal of all deletions later
+				b = 'del'
+				q = 0
+				groups[rg][pos]['bases'].append( b ) # add base to groups dict, within corresponding rg and position.
+				groups[rg][pos]['quals'].append( q ) # add qualities
+				continue
+			elif read.indel > 0: ## checks for insertion. If read.indel is greater than zero, means insertion is present, so we add the insertion to a spearate section of the dictionary
+				length = read.indel
+				b = alignment.query_sequence[qpos]
+				q = ( alignment.query_qualities[qpos] if alignment.query_qualities else self.missingQuality)
+				insb = (alignment.query_sequence[qpos+1:qpos+1+length])
+				insq = ( alignment.query_qualities[qpos+1:qpos+1+length] if alignment.query_qualities else self.missingQuality)
+				groups[rg][pos]['insertion']['bases'].append(insb)
+				groups[rg][pos]['insertion']['quals'].append(insq)
+			else:
+				# this is the most basic. if there is neither an insertion or deletion present, we add the base call and quality score at that position in the read, then move along.
+				b = alignment.query_sequence[qpos]
+				q = ( alignment.query_qualities[qpos] if alignment.query_qualities else self.missingQuality)
+			groups[rg][pos]['bases'].append( b )
+			groups[rg][pos]['quals'].append( q )
+		return(groups)
 
-            for read in site.pileups:
-                qpos = read.query_position
-                alignment = read.alignment
+	def gap_fill(self, groups, groups2):
+		''' here, we transfer the read groups from the first dictionary into the second, while also sorting out any read groups that contain large gaps (indicative of Structural Variants)'''
+		keys = list(groups.keys())
+		for key in keys: 
+			rg = key
+			first = True
+			groups2[rg] = {}
+			for p in groups[rg].keys():
+				if type(p) == str:
+					if p.startswith('ins' or 'del'):
+						groups2[rg][p] = groups[rg][p]
+						old_p += 1
+					continue
+				if first==True:
+					groups2[rg][p] = groups[rg][p]
+					old_p = p
+					first = False
+					continue
+				else:
+					old_p += 1
+					holder = []
+					counter = 0
+					while True: # handles gaps
+						if p > old_p:
+							holder.append(old_p)
+							counter += 1
+							if counter == self.max_gap:
+								# want to handle this case differently... might want to look at dictionary structure to figure out how to work things in
+								holder = []
+								# groups2[rg][p] = groups[rg][p]
+								old_p = p - 1 
+							old_p += 1
+						else:
+							if len(holder) != 0: # if there is a gap under the set length, we append an N to every position isolated.
+								for position in holder:
+									groups2[rg][position]={ 'bases': [self.minDepth*'N'], 'quals': self.minDepth*[0], 'insertion' : {'bases':[], 'quals':[]}}
+							groups2[rg][p] = groups[rg][p]
+							break
+			del groups[rg]
+		return(groups2)
 
-                rg = alignment.reference_name + '/'
+	def write_2_fastq(self, rg, groups2):
+		'''Takes in a read group and the dictionary built in gap_fill, then creates consensus sequence from all reads stored in dictionary and writes in to std.out'''
+		sequence = []
+		quality  = []
+		for rpos in groups2[rg].keys():
+			if rpos == 'leftmost':
+				continue
+			# print(rpos)
+			if rpos not in groups2[rg]: # go one at a time through range, if nothing at given position, add N (0 coverage, could be deletion)
+				sequence.append('N') # would want to put nothing in if deletion, N's in if nothing there (no coverage)
+				quality.append(0)
+				continue
+			bases = groups2[rg][rpos]['bases']
+			quals = groups2[rg][rpos]['quals']
+			try:
+				ins_bases = groups2[rg][rpos]['insertion']['bases']
+				ins_quals = groups2[rg][rpos]['insertion']['quals']
+			except KeyError:
+				print('error here', rg, rpos, groups2[rg][rpos])
+			if len(bases) < self.minDepth:
+				sequence.append('N')
+				quality.append(0)
+				continue
+			# count occurances of bases
+			counts = {}
+			for base in bases:
+				counts[base] = counts.get(base, 0) + 1
+			# calculate frequencies of bases for each position, then use this dictionary to deteremine the most common base at each position
+			freqs = dict([ (base, counts[base] / float(len(bases))) for base in counts ])
+			most_common_base = max(freqs, key=lambda k: freqs[k])
+			if most_common_base == "del": # if there is a del at a given position, write nothing. Better reflection of deletion vs. gap.
+				continue
+			if len(ins_bases) != 0: # checks to see if there are any bases inserted. If so, adds coutns of bases to a dictionary with counts of each base in the insert.
+				counts_ins = {}
+				for base in ins_bases:
+					counts_ins[base] = counts_ins.get(base, 0) + 1
+				freqs_ins = dict([ (base, counts_ins[base] / float(len(ins_bases))) for base in counts_ins]) # determine the most common inserted base per position in insertion
+				most_common_ins = max(freqs_ins, key = lambda k:freqs_ins[k])
+				later = {}
+				ins_quals_new = []
+				sequence.append(most_common_base)
+				quality.append(int(qual_fix(quals)))
+				if len(ins_bases) > 1:
+					for x in range(0, len(ins_bases)):
+						if ins_bases[x] in later.keys():
+							later[ins_bases[x]] = np.vstack([later[ins_bases[x]], ins_quals[x]])
+						else:
+							later[ins_bases[x]] = ins_quals[x]
+					length = len(most_common_ins)
+					for x in ins_bases:
+						ins_quals_new.append(later[x])
+					if freqs_ins[most_common_ins] >= (self.threshold):
+						if length > 1: # if the length of the insert sequences is longer than 1
+							sequence.append(most_common_ins)
+							quals_ins = later[most_common_ins]
+							for d in range(0, length):
+								inv_q = quals_ins[:,d]
+								quality.append(qual_fix(inv_q.tolist()))
+						else: # if length of sequence is 1
+							sequence.append(most_common_ins)
+							quals_ins = later[most_common_ins]
+							inv_q = quals_ins[:,0]
+							quality.append(qual_fix(inv_q.tolist()))
+					else: 
+						continue
+				else: 
+					if freqs_ins[most_common_ins] >= (self.threshold):
+						for insertb in ins_bases:
+							for x in insertb:
+								sequence.append(x)
+						for insertq in ins_quals:
+							for y in insertq:
+								quality.append(y)
+					else:
+						continue
+			if freqs[most_common_base] >= self.threshold: # checks if the frequency of the most common base call is greater than the threshold given
+				sequence.append(most_common_base)
+				# below, isolate quality scores for base calls that agree with most common base call. This will reduce the artificial inflation occurring on base calls.
+				new_qual = []
+				for index, elem in enumerate(bases):
+					if elem == most_common_base:
+						new_qual.append(quals[index])
+				quality.append(int(qual_fix(new_qual)))
+			elif (not self.callAmbiguousBases) or most_common_base == 'N': # if the most common base call is n, we append N and a quality score of 0.
+				sequence.append('N')
+				quality.append(0) # XXX: can this be better? perhaps, might need to revisit and determine proper value? Or, remove N and look at bases after the removal?
+			else:
+				nts = sorted(list(freqs.keys()))
+				if 'N' in nts:
+					nts.remove('N')
+				ambig = ''.join(nts)
+				sequence.append(self.ambiguity[ambig])
+				quality.append(int(qual_fix(quals)))
+		sys.stdout.write(f'{rg}\n{"".join(sequence)}\n+\n{pysam.qualities_to_qualitystring(quality)}\n')
 
-                if not self.ignoreReadGroups:
-                    try:
-                        rg += alignment.get_tag('RG')
-                    except KeyError:
-                        # No read group for this read?!
-                        continue
-                else:
-                    rg += 'Consensus'
-
-                if qpos is None:
-                    continue
-
-                if rg not in groups:
-                    groups[rg] = {}
-                if rpos not in groups[rg]:
-                    groups[rg][rpos] = { 'bases': [], 'quals': [] }
-
-                groups[rg][rpos]['bases'].append( alignment.query_sequence[qpos] )
-                groups[rg][rpos]['quals'].append( alignment.query_qualities[qpos] if alignment.query_qualities else self.missingQuality )
-
-        for rg in sorted(groups):
-            sequence = []
-            quality  = []
-            for rpos in range(min(groups[rg]), max(groups[rg]) + 1):
-                if rpos not in groups[rg]:
-                    sequence.append('N')
-                    quality.append(0)
-                    continue
-
-                bases = groups[rg][rpos]['bases']
-                quals = groups[rg][rpos]['quals']
-
-                if len(bases) < self.minDepth:
-                    sequence.append('N')
-                    quality.append(0)
-                    continue
-
-                # count occurances of bases
-                counts = {}
-                for base in bases:
-                    counts[base] = counts.get(base, 0) + 1
-
-                # calculate frequencies of bases
-                freqs = dict([ (base, counts[base] / float(len(bases))) for base in counts ])
-
-                most_common_base = max(freqs, key=lambda k: freqs[k])
-
-                if freqs[most_common_base] >= self.threshold:
-                    sequence.append(most_common_base)
-                    quality.append(sum(quals) // len(quals)) # XXX: can this be better?
-                elif (not self.callAmbiguousBases) or most_common_base is 'N':
-                    sequence.append('N')
-                    quality.append(0) # XXX: can this be better?
-                else:
-                    nts = sorted(list(freqs.keys()))
-                    if 'N' in nts:
-                        nts.remove('N')
-                    ambig = ''.join(nts)
-                    sequence.append(self.ambiguity[ambig])
-                    quality.append(sum(quals) // len(quals)) # XXX: can this be better?
-
-            # Output FastQ
-            print("@%s\n%s\n+\n%s" % (rg, ''.join(sequence), qualities_to_qualitystring(quality)))
+	def run(self):
+		first = True
+		o = 'temp.bam'
+		obam = pysam.AlignmentFile(o, 'wb', template = self.input)
+		rg_counter = 0
+		for line in self.input:
+			rg = line.get_tag("RG")
+			if first:
+				old_rg = rg
+				obam.write(line)
+				first = False
+				count = 1
+				rg_counter += 1
+			else:
+				if rg == old_rg:
+					obam.write(line)
+					count += 1
+				else: # if the read group is different, we run the last portion. In the future, this will be running simple consensus 
+					if rg_counter == self.maxrg:
+						obam.close() # close the file we were writing to
+						groups = {} ## initialize groups dicitonary. structure is: groups[read group][reference position][bases] XXX better description here!
+						groups2 = {} ## initialize another groups dictionary for use later in the code. Contents of groups will be transferred to this library after gaps are taken into account. 
+						old_rg=rg # set the current read group to be the reference read group used above
+						pysam.sort("-o","temp.sorted.bam",o)
+						pysam.index("temp.sorted.bam") # index the output file
+						obam_r = pysam.AlignmentFile("temp.sorted.bam", 'rb') # open the outfile for reading
+						pileup = obam_r.pileup( stepper='all', max_depth=self.maxDepth, min_base_quality=3) # create a pileup from the output file
+						for site in pileup:
+							### in here is where we put core simple consensus functions
+							self.build_dict(site, groups)
+						groups2 = self.gap_fill(groups, groups2)
+						for rg in sorted(groups2):
+							self.write_2_fastq(rg, groups2)
+						count = 1
+						obam_r.close()
+						# os.remove(o)
+						obam = pysam.AlignmentFile(o, 'wb', template = self.input)
+						obam.write(line)
+						rg_counter = 1
+					else:
+						obam.write(line)
+						old_rg=rg
+						count=1
+						rg_counter+=1
+		groups = {} ## initialize groups dicitonary. structure is: groups[read group][reference position][bases] XXX better description here!
+		groups2 = {} ## initialize another groups dictionary for use later in the code. Contents of groups will be transferred to this library after gaps are taken into account. 
+		obam.close()
+		pysam.sort("-o","temp.sorted.bam",o)
+		pysam.index("temp.sorted.bam") # index the output file... might have to do this before?
+		obam_r = pysam.AlignmentFile("temp.sorted.bam", 'rb')
+		pileup = obam_r.pileup( stepper='all',max_depth=self.maxDepth, min_base_quality=3) #create a pileup from the output file
+		for site in pileup:
+			self.build_dict(site, groups)
+		groups2 = self.gap_fill(groups, groups2)
+		for rg in sorted(groups2):
+			self.write_2_fastq(rg, groups2)
+		obam_r.close()
+		self.input.close()
 
 class BetterFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
     pass
@@ -117,7 +321,7 @@ class BetterFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescri
 def parseCommandArguments(*args):
     parser = argparse.ArgumentParser(
         description = dedent('''\
-            Constructs a simple (dumb) consensus sequence for each read group
+            Constructs a consensus sequence for each read group
             (RG) in a BAM file.
 
             Base qualities are averaged for each site.  Percent identity
@@ -161,7 +365,7 @@ def parseCommandArguments(*args):
     parser.add_argument("--max-depth",
         dest     = "maxDepth",
         type     = int,
-        default  = 8000,
+        default  = 100000, ###adjust this later
         help     = "Maximum number of reads considered for a single consensus position",
         metavar  = "n")
 
@@ -182,11 +386,24 @@ def parseCommandArguments(*args):
         help     = "Quality score to use for bases missing a quality score",
         metavar  = "q")
 
+    parser.add_argument("-r", "--max_rg",
+        dest     = "max_rg",
+        type     = int,
+        default  = 100,
+        help     = "Number of read groups included in each temporary bam file",
+        metavar  = "r")
+
+    parser.add_argument("--max_gap",
+        dest     = "max_gap",
+        type     = int,
+        required = False,
+        default  = 35,
+        help     = "Maximum allowed gap in consensus read. Once this number is reached, gap is no longer filled with 'N' base calls and is instead ignored, in hopes of catching large indels")
+
     parser.set_defaults(
         ambiguous        = False,
         ignoreReadGroups = False
     )
-
     return vars(parser.parse_args(*args))
 
 if __name__ == '__main__':
